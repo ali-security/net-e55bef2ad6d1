@@ -1,0 +1,83 @@
+# Upstream golang.org/x/net has no GitHub Actions CI (it is developed on
+# Gerrit and tested by the Go build dashboard), so this workflow was authored
+# for the sealing pipeline. It mirrors what the project itself does: build every
+# package with the toolchain named by the `go` directive in go.mod, run the full
+# `go test ./...` suite, and pack the module source zip that proxy.golang.org
+# serves as the release artifact.
+name: build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Space-separated Go test names to run instead of the full suite (empty runs everything)"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    name: build and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # go.mod's `go 1.24.0` directive is the module's MINIMUM, not the toolchain
+      # the project tests with: nine http2 test files (transport_test.go,
+      # server_test.go, http2_test.go, clientconn_test.go, connframes_test.go,
+      # config_test.go, frame_test.go, netconn_test.go, server_push_test.go) are
+      # gated `//go:build go1.25 || goexperiment.synctest`, so on 1.24 the whole
+      # http2 suite compiles away to nothing and reports `ok ... 0.009s`. Go
+      # 1.25.1 was the current stable release when v0.45.0 shipped and is what
+      # actually exercises those tests.
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.1"
+
+      - name: Show toolchain
+        run: go version
+
+      - name: Download module dependencies
+        run: go mod download
+
+      # The module zip is packed from a copy of the tree with .github removed:
+      # upstream ships no .github files at this version, so the workflow and the
+      # packing helper added here must not become members of the artifact.
+      - name: Pack module zip
+        run: |
+          set -euo pipefail
+          MODSRC="${RUNNER_TEMP}/modsrc"
+          OUT="${RUNNER_TEMP}/build_output"
+          mkdir -p "${MODSRC}" "${OUT}"
+          rsync -a --exclude '.git' --exclude '.github' ./ "${MODSRC}/"
+          cd .github/modzip
+          go get golang.org/x/mod@latest
+          go run . golang.org/x/net v0.45.0 "${MODSRC}" "${OUT}/v0.45.0.zip"
+          unzip -l "${OUT}/v0.45.0.zip" | tail -5
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        run: |
+          set -euo pipefail
+          FILTER="${{ inputs.test-filter }}"
+          if [ -n "${FILTER}" ]; then
+            go test -v -run "^($(echo "${FILTER}" | tr ' ' '|'))$" ./... 2>&1 | tee /tmp/scoped.log
+            for t in ${FILTER}; do
+              grep -qE "^=== RUN[[:space:]]+${t}(/|\$)" /tmp/scoped.log || {
+                echo "selected test ${t} never ran"; exit 1;
+              }
+            done
+          else
+            go test ./...
+          fi
+
+      - name: Upload module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/build_output/v0.45.0.zip
+          if-no-files-found: error
