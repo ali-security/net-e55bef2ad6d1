@@ -12,6 +12,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"golang.org/x/net/html/atom"
 )
 
 // https://github.com/golang/go/issues/58246
@@ -626,6 +628,16 @@ var tokenTests = []tokenTest{
 		`<p a=/>`,
 		`<p a="/">`,
 	},
+	{
+		"duplicate attributes",
+		`<p foo="bar" foo="baz">`,
+		`<p foo="bar">`,
+	},
+	{
+		"duplicate attributes, different case",
+		`<p FOO="bar" foo="baz">`,
+		`<p foo="bar">`,
+	},
 }
 
 func TestTokenizer(t *testing.T) {
@@ -830,6 +842,85 @@ func TestSelfClosingTagValueConfusion(t *testing.T) {
 	tok := z.Next()
 	if tok != StartTagToken {
 		t.Fatalf("unexpected token type: got %s, want %s", tok, StartTagToken)
+	}
+}
+
+func TestUnicodeAttributeCase(t *testing.T) {
+	// <div a="1" A="1"> is resolved to <div a="1"> because a and A are considered
+	// duplicate attribute names. Different unicode cases are not considered equal
+	// though, so <div ä="1" Ä="1"> is tokenized as <div ä="1" Ä="1">.
+	f := `<div ä="1" Ä="1">`
+	z := NewTokenizer(strings.NewReader(f))
+	if tt := z.Next(); tt != StartTagToken {
+		t.Fatalf("expected StartTagToken, got %s", tt)
+	}
+	tok := z.Token()
+	if len(tok.Attr) != 2 {
+		t.Fatalf("expected 2 attributes, got %d", len(tok.Attr))
+	}
+	if tok.Attr[0].Key != "ä" {
+		t.Errorf("expected attribute key to be 'ä', got %s", tok.Attr[0].Key)
+	}
+	if tok.Attr[1].Key != "Ä" {
+		t.Errorf("expected attribute key to be 'Ä', got %s", tok.Attr[1].Key)
+	}
+}
+
+func TestDuplicateAttributesAreDropped(t *testing.T) {
+	// Keeping a duplicate attribute lets an attacker smuggle a second value past
+	// code that inspects or rewrites only one of them, while a browser honors the
+	// first. Only the first occurrence of a key may survive tokenizing, parsing
+	// and rendering. Attribute name matching is ASCII case-insensitive.
+	tests := []struct {
+		desc string
+		html string
+		want string
+	}{
+		{"quoted duplicate", `<a href="/safe" href="javascript:alert(1)">x</a>`, `<a href="/safe">x</a>`},
+		{"upper-case duplicate", `<a HREF="/safe" href="javascript:alert(1)">x</a>`, `<a href="/safe">x</a>`},
+		{"mixed-case duplicate", `<a hReF="/safe" HrEf="javascript:alert(1)">x</a>`, `<a href="/safe">x</a>`},
+		{"unquoted duplicate", `<a href=/safe href=javascript:alert(1)>x</a>`, `<a href="/safe">x</a>`},
+		{"empty first value", `<a href="" href="javascript:alert(1)">x</a>`, `<a href="">x</a>`},
+		{"event handler duplicate", `<img src="x" onerror="a()" ONERROR="alert(1)"/>`, `<img src="x" onerror="a()"/>`},
+		{"three occurrences", `<a href="/safe" href="/b" href="/c">x</a>`, `<a href="/safe">x</a>`},
+	}
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			// The tokenizer must expose each key at most once.
+			z := NewTokenizer(strings.NewReader(test.html))
+			if tt := z.Next(); tt != StartTagToken && tt != SelfClosingTagToken {
+				t.Fatalf("first token: got %s, want a start tag", tt)
+			}
+			seen := map[string]bool{}
+			for _, a := range z.Token().Attr {
+				if seen[a.Key] {
+					t.Errorf("tokenizer returned duplicate attribute %q", a.Key)
+				}
+				seen[a.Key] = true
+			}
+
+			// Parsing and re-rendering must not reintroduce the smuggled value.
+			nodes, err := ParseFragment(strings.NewReader(test.html), &Node{
+				Type:     ElementNode,
+				Data:     "body",
+				DataAtom: atom.Body,
+			})
+			if err != nil {
+				t.Fatalf("ParseFragment: %v", err)
+			}
+			var buf bytes.Buffer
+			for _, n := range nodes {
+				if err := Render(&buf, n); err != nil {
+					t.Fatalf("Render: %v", err)
+				}
+			}
+			if got := buf.String(); got != test.want {
+				t.Errorf("round trip: got %q, want %q", got, test.want)
+			}
+			if strings.Contains(buf.String(), "javascript:alert(1)") || strings.Contains(buf.String(), "alert(1)") {
+				t.Errorf("smuggled attribute value survived: %q", buf.String())
+			}
+		})
 	}
 }
 
